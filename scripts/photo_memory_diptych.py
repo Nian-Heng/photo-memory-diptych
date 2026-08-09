@@ -31,7 +31,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
 DEFAULT_KEY = "sk-aamycyltxjhzoohyzkjhqjdeurgfiyvvprgpmdmbbpxwlsuz"
-AI_MODEL = "Qwen/Qwen-Image"          # 文生图
+AI_MODEL = "Qwen/Qwen-Image"   # 文生图(画得最像照片, 用独立干净提示词可压住白圆衬底)
 VL_MODEL = "Qwen/Qwen3-VL-32B-Instruct"  # 多模态读图
 AI_SIZE = "832x1248"                  # 竖版抽象图
 
@@ -105,12 +105,35 @@ def ai_abstract_description(photo_path):
 
 
 def build_abstract_prompt(desc):
-    """把 AI 抽象描述包装成文生图提示词, 硬性保证单色纯背景。"""
+    """把 AI 抽象描述包装成文生图提示词, 洗掉引导画圆/光环的词, 硬性保证平铺单色背景。"""
+    import re
+    # 洗掉会诱导 AI 画圆形衬底/光环/月亮的英文词(替换为中性表达)
+    cleaned = desc
+    for pat, repl in [
+        (r"\bcir(?:cular|cle)\s+(?:frame|ring|border|backdrop|background)\b", "geometric arrangement"),
+        (r"\bcir(?:cular|cle)\b[^,;.]{0,25}?\b(frame|background|border|backdrop)\b", "geometric forms"),
+        (r"\bhalo\b", "highlight shapes"),
+        (r"\b(moon|full moon|sun disc|sun disc|sun)\b", "light accents"),
+        (r"\b(round backdrop|circular halo|ring|wheel)\b", "shapes"),
+        (r"set within a circular frame", "arranged as flat shapes"),
+        (r"inside a circle", "as flat shapes"),
+        # 抽掉 MOTIF 里的"divided by a vertical line / bands"这类导致画怪图形的描述
+        (r"\bdivided by a single\s+[a-z ]*vertical line\b", "arranged"),
+        (r"\b(minimalist composition of )?horizontal bands\b", "flat layered shapes"),
+    ]:
+        cleaned = re.sub(pat, repl, cleaned, flags=re.IGNORECASE)
     return (
-        f"极简扁平抽象几何图案: {desc}。"
-        "背景必须是干净的单一象牙白纯色, 背景上绝对不允许出现任何圆形、色块、圆圈、"
-        "边框、衬底、描边或额外形状作为'容器'——图案直接画在这个纯色背景上。"
-        "图案居中, 无文字无渐变无阴影, 配色从照片中提炼, 背景纯色无任何装饰。"
+        f"把这张照片画成一个贴合原图主体形态的简化扁平插画, 只依据这张照片本身的内容来画: {cleaned}。"
+        "画面主体必须能一眼认出就是这张原照片里的东西(发冰海就画冰海、发插花就画花瓶插花、发足球就画足球和地面), "
+        "是这张照片内容的纯粹简化提炼, 不是自由抽象拼贴。"
+        "构图和配色只从这张照片里提取, 不参考也不带入任何其他画面。"
+        "这是唯一一张照片, 之前画过的任何图片里的元素(人、物体、景物)一概作废、不得在本图出现。"
+        "只允许画这张照片里真实存在的东西, 严格禁止添加照片里没有的物体: 禁止任何人物、人形、人影剪影、动物, "
+        "禁止台阶、围栏、门、拱门、窗户、树木、建筑物、太阳、云朵、花瓶、花朵等原图里不存在的内容。"
+        "背景必须是完全单一的一种纯白色(纯白#FFFFFF), 整幅背景没有任何装饰、没有第二种颜色、没有渐变。"
+        "主体全部由直线的扁平色块构成, 绝对禁止绘制任何圆形、圆环、椭圆、光晕、光环、满月、太阳、"
+        "圆形衬底、圆形边框、圆形光斑、阴影、倒影或任何圆弧——出现任何圆弧即失败。"
+        "无文字无边框无阴影无发光, 使用扁平纯色, 不用渐隐、不用透明度、不用光晕效果。"
     )
 
 
@@ -190,7 +213,40 @@ def compose(photo_path, ai_path, out_path, title):
     ai_scaled = ai.resize((ai_tw, ai_th))
     x0 = (pw - ai_tw) // 2
     y0 = panel_top + (panel_h - ai_th) // 2
+    # ===== 程序兜底: 洪泛净化 背景圆形衬底(白圆/光晕), 只清连通边界的背景, 不伤主体 =====
+    # 在 AI 缩略图上做: 从四边出发 flood-fill 蔓延接近背景白的连续区, 染成统一背景色。
+    # 主体内部的白色(如酒杯高光)不连通边界, 不会被误删。
+    def flood_clean_bg(img, bg_color, tol=30):
+        w2, h2 = img.size
+        px = img.load()
+        from collections import deque
+        q = deque()
+        for x in range(w2):
+            q.append((x, 0)); q.append((x, h2 - 1))
+        for y in range(h2):
+            q.append((0, y)); q.append((w2 - 1, y))
+        visited = set()
+        while q:
+            x, y = q.popleft()
+            if (x, y) in visited:
+                continue
+            visited.add((x, y))
+            c = px[x, y]
+            if all(abs(c[i] - bg_color[i]) <= tol for i in range(3)) or all(v >= 240 for v in c):
+                px[x, y] = bg_color
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < w2 and 0 <= ny < h2 and (nx, ny) not in visited:
+                        nc = px[nx, ny]
+                        if all(abs(nc[i] - bg_color[i]) <= tol + 12 for i in range(3)) or all(v >= 240 for v in nc):
+                            q.append((nx, ny))
+        return img
+
+    ai_scaled = flood_clean_bg(ai_scaled, bg)
     canvas.paste(ai_scaled, (x0, y0))
+
+
+
 
     # ===== 动态标题避让: 英文绝不压抽象图 =====
     title_font = 34
